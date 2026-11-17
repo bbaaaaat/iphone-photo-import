@@ -16,6 +16,7 @@ struct ImportView: View {
     @State private var status = "请选择存放照片的文件夹。"
     @State private var progress = 0.0
     @State private var issues: [String] = []
+    @State private var folderStatus = "正在创建导入目录…"
 
     var body: some View {
         NavigationStack {
@@ -35,6 +36,7 @@ struct ImportView: View {
                     }
                     .disabled(running)
                     Text(status)
+                    Text(folderStatus).font(.footnote)
                     if running || progress > 0 {
                         ProgressView(value: progress)
                     }
@@ -50,6 +52,25 @@ struct ImportView: View {
                 }
             }
             .navigationTitle("照片批量导入")
+        }
+        .onAppear {
+            do {
+                let documents = try FileManager.default.url(for: .documentDirectory,
+                                                             in: .userDomainMask,
+                                                             appropriateFor: nil, create: true)
+                let inbox = documents.appendingPathComponent("把照片复制到这里", isDirectory: true)
+                try FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
+                let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+                let sharing = Bundle.main.object(forInfoDictionaryKey: "UIFileSharingEnabled") as? Bool == true
+                let inPlace = Bundle.main.object(forInfoDictionaryKey: "LSSupportsOpeningDocumentsInPlace") as? Bool == true
+                if sharing && inPlace {
+                    folderStatus = "v\(version) · 已创建「把照片复制到这里」"
+                } else {
+                    folderStatus = "v\(version) · 当前安装包缺少「文件」共享设置"
+                }
+            } catch {
+                folderStatus = "创建目录失败：\(error.localizedDescription)"
+            }
         }
         .sheet(isPresented: $picking) {
             FolderPicker { folder in
