@@ -17,7 +17,7 @@ struct ImportView: View {
     @State private var picking = false
     @State private var reviewingLibrary = false
     @State private var running = false
-    @State private var status = "从「文件」把原始图片批量保存到系统照片。"
+    @State private var status = "从「文件」批量保存照片和视频到系统相册。"
     @State private var progress = 0.0
     @State private var issues: [String] = []
     @State private var folderStatus = ""
@@ -47,7 +47,7 @@ struct ImportView: View {
                         Button {
                             importLocalFolder()
                         } label: {
-                            Label("导入 App 文件夹中的照片", systemImage: "square.and.arrow.down")
+                            Label("导入 App 文件夹中的照片和视频", systemImage: "square.and.arrow.down")
                                 .font(.headline)
                                 .frame(maxWidth: .infinity)
                                 .padding(16)
@@ -235,11 +235,11 @@ struct ImportView: View {
             if completed && !reduceMotion {
                 UINotificationFeedbackGenerator().notificationOccurred(issues.isEmpty ? .success : .warning)
             }
-            status = "已导入 \(report.saved) 张，已跳过 \(report.skipped) 张重复照片。"
+            status = "已导入 \(report.saved - report.videos) 张照片、\(report.videos) 个视频，跳过 \(report.skipped) 个重复文件。"
             if report.live > 0 { status += " 含 \(report.live) 张实况照片。" }
             if !issues.isEmpty { status += " 有 \(issues.count) 项需要检查。" }
             if report.saved + report.skipped == 0 && issues.isEmpty {
-                status = "这个文件夹没有找到可导入的图片。"
+                status = "这个文件夹没有找到可导入的照片或视频。"
             }
         }
     }
@@ -281,6 +281,7 @@ enum Importer {
     struct Report: Sendable {
         var saved = 0
         var live = 0
+        var videos = 0
         var skipped = 0
         var issues: [String] = []
     }
@@ -296,6 +297,7 @@ enum Importer {
         let video: StagedResource?
         let liveIdentifier: String?
         let contentIdentifier: String
+        let standaloneVideo: Bool
     }
 
     static func run(folder: URL, needsScope: Bool, update: @Sendable (Int, Int) async -> Void) async -> Report {
@@ -334,7 +336,7 @@ enum Importer {
                 }
                 for entry in children {
                     guard let url = entry as? URL else { continue }
-                    if url.pathExtension.lowercased() == "mov" {
+                    if let type = UTType(filenameExtension: url.pathExtension), type.conforms(to: .movie) {
                         movies.append(url)
                     } else if let type = UTType(filenameExtension: url.pathExtension), type.conforms(to: .image) {
                         files.append(url)
@@ -345,14 +347,18 @@ enum Importer {
 
             // Match original assets by their embedded ID, even when export renamed the files.
             var pairedMovies: [String: URL] = [:]
+            var movieIDs: [URL: String] = [:]
+            var pairedIDs = Set<String>()
             if !files.isEmpty {
-                for movie in movies.sorted(by: { $0.path < $1.path }) {
+                for movie in movies where movie.pathExtension.lowercased() == "mov" {
                     do {
                         try coordinate(movie) { readable in
                             let metadata = AVURLAsset(url: readable).metadata(forFormat: .quickTimeMetadata)
                             if let id = metadata.first(where: { $0.identifier == .quickTimeMetadataContentIdentifier })?.stringValue,
-                               !id.isEmpty, pairedMovies[id.lowercased()] == nil {
-                                pairedMovies[id.lowercased()] = movie
+                               !id.isEmpty {
+                                let key = id.lowercased()
+                                movieIDs[movie] = key
+                                if pairedMovies[key] == nil { pairedMovies[key] = movie }
                             }
                         }
                     } catch {
@@ -361,13 +367,20 @@ enum Importer {
                 }
             }
 
-            for offset in stride(from: 0, to: files.count, by: 16) {
-                let end = min(offset + 16, files.count)
+            let imageCount = files.count
+            let videoFiles = Set(movies)
+            files.append(contentsOf: movies.sorted { $0.path < $1.path })
+
+            let imageBatches = stride(from: 0, to: imageCount, by: 16).map { $0..<min($0 + 16, imageCount) }
+            let videoBatches = (imageCount..<files.count).map { $0..<($0 + 1) }
+            for range in imageBatches + videoBatches {
                 var batch: [StagedPhoto] = []
                 var pending = Set<String>()
                 var duplicates: [(source: URL, identifier: String)] = []
                 let previousRecordCount = imported.count
-                for source in files[offset..<end] {
+                for source in files[range] {
+                    let standaloneVideo = videoFiles.contains(source)
+                    if let id = movieIDs[source], pairedIDs.contains(id) { continue }
                     do {
                         var still: StagedResource?
                         var movie: URL?
@@ -375,12 +388,14 @@ enum Importer {
                             let values = try readable.resourceValues(forKeys: keys)
                             guard values.isRegularFile == true else { return }
                             let stillID = fingerprint(source, values)
-                            if !pairedMovies.isEmpty,
+                            if !standaloneVideo, !pairedMovies.isEmpty,
                                let image = CGImageSourceCreateWithURL(readable as CFURL, nil),
                                let properties = CGImageSourceCopyPropertiesAtIndex(image, 0, nil) as NSDictionary?,
                                let maker = properties[kCGImagePropertyMakerAppleDictionary] as? NSDictionary,
                                let id = maker["17"] as? String {
-                                movie = pairedMovies[id.lowercased()]
+                                let key = id.lowercased()
+                                movie = pairedMovies[key]
+                                if movie != nil { pairedIDs.insert(key) }
                             }
                             still = try stage(source: source, readable: readable, identifier: stillID, in: staging)
                         }
@@ -406,7 +421,8 @@ enum Importer {
                         if let video {
                             contentIdentifier = "live-sha256:\(stillHash):\(try contentHash(video.copy))"
                         } else {
-                            contentIdentifier = "photo-sha256:\(stillHash)"
+                            let prefix = standaloneVideo ? "video-sha256" : "photo-sha256"
+                            contentIdentifier = "\(prefix):\(stillHash)"
                         }
                         // Older imports only recorded the file path, size and modification date.
                         if imported.contains(liveIdentifier ?? still.identifier) {
@@ -421,7 +437,8 @@ enum Importer {
                             continue
                         }
                         batch.append(StagedPhoto(still: still, video: video, liveIdentifier: liveIdentifier,
-                                                 contentIdentifier: contentIdentifier))
+                                                 contentIdentifier: contentIdentifier,
+                                                 standaloneVideo: standaloneVideo))
                         retained = true
                     } catch {
                         report.issues.append("\(source.lastPathComponent) · \(error.localizedDescription)")
@@ -448,6 +465,7 @@ enum Importer {
                     report.saved += saved.count
                     for photo in saved {
                         imported.insert(photo.contentIdentifier)
+                        if photo.standaloneVideo { report.videos += 1 }
                         if photo.liveIdentifier != nil {
                             report.live += 1
                         }
@@ -467,7 +485,7 @@ enum Importer {
                 if imported.count != previousRecordCount {
                     try JSONEncoder().encode(imported).write(to: journal, options: .atomic)
                 }
-                await update(end, files.count)
+                await update(range.upperBound, files.count)
             }
         } catch {
             report.issues.append("导入已停止 · \(error.localizedDescription)")
@@ -517,7 +535,7 @@ enum Importer {
         try PHPhotoLibrary.shared().performChangesAndWait {
             for photo in photos {
                 let asset = PHAssetCreationRequest.forAsset()
-                add(photo.still, as: .photo, to: asset)
+                add(photo.still, as: photo.standaloneVideo ? .video : .photo, to: asset)
                 if let video = photo.video {
                     add(video, as: .pairedVideo, to: asset)
                 }
@@ -557,6 +575,15 @@ struct LibraryDuplicatesView: View {
                         scanID = UUID()
                     }
                     .disabled(scanning || deleting)
+                    if !groups.isEmpty {
+                        Button(selected == suggestedSelection ? "清空勾选" : "一键勾选") {
+                            selected = selected == suggestedSelection ? [] : suggestedSelection
+                        }
+                        .disabled(scanning || deleting)
+                        Text("每组优先保留收藏的照片，其次保留拍摄最早的一张。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 } footer: {
                     Text("仅检查设备上的原件。只存在于 iCloud 的照片会跳过。删除前可逐张勾选，每组至少保留一张。")
                 }
@@ -606,6 +633,13 @@ struct LibraryDuplicatesView: View {
         .task(id: scanID) {
             if scanID != nil { await scan() }
         }
+    }
+
+    private var suggestedSelection: Set<String> {
+        Set(groups.flatMap { group in
+            let keeper = group.photos.first(where: { $0.favorite }) ?? group.photos.first
+            return group.photos.filter { $0.id != keeper?.id }.map(\.id)
+        })
     }
 
     @MainActor
