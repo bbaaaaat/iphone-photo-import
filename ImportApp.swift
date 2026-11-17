@@ -549,7 +549,7 @@ struct LibraryDuplicatesView: View {
     @State private var groups: [DuplicateGroup] = []
     @State private var selected = Set<String>()
     @State private var scanID: UUID?
-    @State private var status = "在本机查找文件内容完全相同的照片。"
+    @State private var status = "在本机查找文件内容完全相同的照片和视频。"
     @State private var scanned = 0
     @State private var total = 0
     @State private var scanning = false
@@ -580,7 +580,7 @@ struct LibraryDuplicatesView: View {
                             selected = selected == suggestedSelection ? [] : suggestedSelection
                         }
                         .disabled(scanning || deleting)
-                        Text("每组优先保留收藏的照片，其次保留拍摄最早的一张。")
+                        Text("每组优先保留收藏的项目，其次保留拍摄最早的一项。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -614,7 +614,7 @@ struct LibraryDuplicatesView: View {
             .safeAreaInset(edge: .bottom) {
                 if !groups.isEmpty {
                     Button(role: .destructive) { confirming = true } label: {
-                        Text("删除选中的 \(selected.count) 张").frame(maxWidth: .infinity)
+                        Text("删除选中的 \(selected.count) 个").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
                     .disabled(selected.isEmpty || deleting)
@@ -622,11 +622,11 @@ struct LibraryDuplicatesView: View {
                     .background(.regularMaterial)
                 }
             }
-            .alert("删除选中的 \(selected.count) 张照片？", isPresented: $confirming) {
+            .alert("删除选中的 \(selected.count) 个项目？", isPresented: $confirming) {
                 Button("取消", role: .cancel) {}
                 Button("删除", role: .destructive) { Task { await deleteSelected() } }
             } message: {
-                Text("系统会再次确认。这些照片会进入「最近删除」。")
+                Text("系统会再次确认。所选照片和视频会进入「最近删除」。")
             }
         }
         .interactiveDismissDisabled(deleting)
@@ -667,8 +667,8 @@ struct LibraryDuplicatesView: View {
         }
         guard !Task.isCancelled else { return }
         groups = result.groups
-        status = groups.isEmpty ? "未发现完全相同的照片。" : "找到 \(groups.count) 组重复照片。"
-        if result.skipped > 0 { status += " 有 \(result.skipped) 张无法在本机读取原件，已跳过。" }
+        status = groups.isEmpty ? "未发现完全相同的照片或视频。" : "找到 \(groups.count) 组重复项目。"
+        if result.skipped > 0 { status += " 有 \(result.skipped) 个项目无法在本机读取原件，已跳过。" }
         if limited { status += " 当前只扫描了你授权的照片。" }
     }
 
@@ -701,13 +701,13 @@ struct LibraryDuplicatesView: View {
                 return remaining.count > 1 ? DuplicateGroup(id: group.id, photos: remaining) : nil
             }
             selected = []
-            status = "已删除 \(targets.count) 张。"
+            status = "已删除 \(targets.count) 个项目。"
         } catch {
             let failure = error as NSError
             if failure.domain == PHPhotosErrorDomain && failure.code == PHPhotosError.Code.userCancelled.rawValue {
                 status = "已取消删除。"
             } else {
-                status = "未删除照片。\(error.localizedDescription)"
+                status = "未删除所选项目。\(error.localizedDescription)"
             }
         }
     }
@@ -739,10 +739,11 @@ struct PhotoReviewRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                if photo.favorite || photo.live {
+                if photo.favorite || photo.live || photo.video {
                     HStack {
                         if photo.favorite { Label("收藏", systemImage: "heart.fill") }
                         if photo.live { Label("实况", systemImage: "livephoto") }
+                        if photo.video { Label("视频", systemImage: "video") }
                     }
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -781,6 +782,7 @@ struct DuplicatePhoto: Identifiable, Sendable {
     let modified: Date?
     let favorite: Bool
     let live: Bool
+    let video: Bool
 }
 
 struct DuplicateGroup: Identifiable, Sendable {
@@ -797,7 +799,9 @@ enum LibraryDuplicateScanner {
     static func scan(update: @Sendable (Int, Int) async -> Void) async -> Result {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
-        let assets = PHAsset.fetchAssets(with: .image, options: options)
+        options.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d",
+                                        PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
+        let assets = PHAsset.fetchAssets(with: options)
         var matches: [String: [DuplicatePhoto]] = [:]
         var skipped = 0
         await update(0, assets.count)
@@ -805,7 +809,9 @@ enum LibraryDuplicateScanner {
             if Task.isCancelled { break }
             let asset = assets.object(at: index)
             let resources = PHAssetResource.assetResources(for: asset)
-            if let original = resources.first(where: { $0.type == .photo }) {
+            let video = asset.mediaType == .video
+            let primaryType: PHAssetResourceType = video ? .video : .photo
+            if let original = resources.first(where: { $0.type == primaryType }) {
                 do {
                     var keys: [String] = []
                     for resource in resources {
@@ -813,10 +819,10 @@ enum LibraryDuplicateScanner {
                         keys.append("\(resource.type.rawValue):\(try await hash(resource))")
                     }
                     let live = asset.mediaSubtypes.contains(.photoLive)
-                    let key = "\(live):" + keys.sorted().joined(separator: "|")
+                    let key = "\(asset.mediaType.rawValue):\(live):" + keys.sorted().joined(separator: "|")
                     matches[key, default: []].append(DuplicatePhoto(id: asset.localIdentifier,
                         filename: original.originalFilename, created: asset.creationDate,
-                        modified: asset.modificationDate, favorite: asset.isFavorite, live: live))
+                        modified: asset.modificationDate, favorite: asset.isFavorite, live: live, video: video))
                 } catch {
                     skipped += 1
                 }
