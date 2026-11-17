@@ -10,5 +10,4 @@ INFOPLIST_KEY_CFBundleDisplayName = 照片批量导入
 INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = 将你从文件中选择的照片保存到系统相册。
 INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES
 INFOPLIST_KEY_UILaunchScreen_Generation = YES
-INFOPLIST_KEY_UIFileSharingEnabled = YES
-INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES
+INFOPLIST_FILE = Info.plist
