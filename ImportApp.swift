@@ -13,46 +13,84 @@ struct ImportApp: App {
 struct ImportView: View {
     @State private var picking = false
     @State private var running = false
-    @State private var status = "请选择存放照片的文件夹。"
+    @State private var status = "从「文件」把原始图片批量保存到系统照片。"
     @State private var progress = 0.0
     @State private var issues: [String] = []
-    @State private var folderStatus = "正在创建导入目录…"
+    @State private var folderStatus = ""
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var measured = false
+    @State private var completed = false
+
+    private let mint = Color(red: 0.65, green: 0.96, blue: 0.77)
+    private let ink = Color(red: 0.05, green: 0.11, blue: 0.10)
 
     var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    Button("选择文件夹并导入") { picking = true }
-                        .disabled(running)
-                    Button("导入 App 文件夹中的照片") {
-                        do {
-                            let folder = try FileManager.default.url(for: .documentDirectory,
-                                                                      in: .userDomainMask,
-                                                                      appropriateFor: nil, create: true)
-                            start(folder, needsScope: false)
-                        } catch {
-                            status = error.localizedDescription
+        ZStack {
+            ink.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    HStack {
+                        Text("照片批量导入")
+                            .font(.headline)
+                        Spacer()
+                        Text("v" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    hero
+                    VStack(alignment: .leading, spacing: 12) {
+                        Button {
+                            importLocalFolder()
+                        } label: {
+                            Label("导入 App 文件夹中的照片", systemImage: "square.and.arrow.down")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(16)
+                                .foregroundStyle(ink)
+                                .background(mint, in: RoundedRectangle(cornerRadius: 17))
+                        }
+                        Button {
+                            picking = true
+                        } label: {
+                            Label("从「文件」选择其他文件夹", systemImage: "folder")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(15)
+                                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 17))
                         }
                     }
+                    .buttonStyle(.plain)
                     .disabled(running)
-                    Text(status)
-                    Text(folderStatus).font(.footnote)
-                    if running || progress > 0 {
-                        ProgressView(value: progress)
+                    .opacity(running ? 0.5 : 1)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("照片存放位置", systemImage: "folder.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(mint)
+                        Text("文件 → 我的 iPhone → 照片批量导入 → 把照片复制到这里")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        if !folderStatus.isEmpty {
+                            Text(folderStatus).font(.footnote).foregroundStyle(.orange)
+                        }
                     }
-                } footer: {
-                    Text("会扫描子文件夹。导入时请保持 App 在前台。如果「打开」无响应，可在「文件」中把照片文件夹复制到「我的 iPhone → 照片批量导入」，然后使用第二个按钮。")
-                }
-                if !issues.isEmpty {
-                    Section("未导入的项目") {
-                        ForEach(issues.indices, id: \.self) { index in
-                            Text(issues[index]).font(.footnote)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    if !issues.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("未导入的项目").font(.headline)
+                            ForEach(issues.indices, id: \.self) { index in
+                                Text(issues[index]).font(.footnote).foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
+                .frame(maxWidth: 560)
+                .padding(22)
+                .frame(maxWidth: .infinity)
             }
-            .navigationTitle("照片批量导入")
         }
+        .foregroundStyle(.white)
+        .preferredColorScheme(.dark)
         .onAppear {
             do {
                 let documents = try FileManager.default.url(for: .documentDirectory,
@@ -64,7 +102,7 @@ struct ImportView: View {
                 let sharing = Bundle.main.object(forInfoDictionaryKey: "UIFileSharingEnabled") as? Bool == true
                 let inPlace = Bundle.main.object(forInfoDictionaryKey: "LSSupportsOpeningDocumentsInPlace") as? Bool == true
                 if sharing && inPlace {
-                    folderStatus = "v\(version) · 已创建「把照片复制到这里」"
+                    folderStatus = ""
                 } else {
                     folderStatus = "v\(version) · 当前安装包缺少「文件」共享设置"
                 }
@@ -81,10 +119,84 @@ struct ImportView: View {
         }
     }
 
+    private var hero: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 22)
+                    .fill(mint.opacity(0.10))
+                    .frame(width: 66, height: 66)
+                if running && !reduceMotion {
+                    TimelineView(.animation) { context in
+                        let turn = context.date.timeIntervalSinceReferenceDate
+                            .truncatingRemainder(dividingBy: 1.4) / 1.4
+                        Circle().trim(from: 0, to: 0.24)
+                            .stroke(mint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                            .frame(width: 53, height: 53)
+                            .rotationEffect(.degrees(turn * 360))
+                    }
+                    .accessibilityHidden(true)
+                }
+                Image(systemName: completed ? "checkmark" : running ? "arrow.down" : "photo.on.rectangle.angled")
+                    .font(.system(size: 25, weight: .semibold))
+                    .foregroundStyle(mint)
+                    .accessibilityHidden(true)
+            }
+            .frame(width: 66, height: 66)
+
+            Text(running ? "正在导入" : completed ? "导入完成" : "把照片放回相册")
+                .font(.system(.largeTitle, design: .rounded, weight: .bold))
+                .accessibilityAddTraits(.isHeader)
+
+            Text(status)
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if running || measured {
+                if measured {
+                    ProgressView(value: progress)
+                        .tint(mint)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.28), value: progress)
+                        .accessibilityLabel("导入进度")
+                } else {
+                    ProgressView().tint(mint)
+                        .accessibilityLabel("正在扫描照片")
+                }
+            }
+            if running {
+                Text("导入期间请保持 App 在前台。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LinearGradient(colors: [Color(red: 0.13, green: 0.28, blue: 0.23), Color(red: 0.08, green: 0.18, blue: 0.16)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing),
+            in: RoundedRectangle(cornerRadius: 29)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 29).strokeBorder(mint.opacity(0.14))
+        }
+    }
+
+    private func importLocalFolder() {
+        do {
+            let folder = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
+                                                      appropriateFor: nil, create: true)
+            start(folder, needsScope: false)
+        } catch {
+            status = error.localizedDescription
+        }
+    }
+
     private func start(_ folder: URL, needsScope: Bool) {
         running = true
         issues = []
         progress = 0
+        measured = false
+        completed = false
         status = "正在准备导入…"
         Task { @MainActor in
             defer { running = false }
@@ -96,12 +208,17 @@ struct ImportView: View {
             let report = await Task.detached(priority: .userInitiated) {
                 await Importer.run(folder: folder, needsScope: needsScope) { done, total in
                     await MainActor.run {
+                        measured = true
                         progress = Double(done) / Double(max(total, 1))
                         status = "已处理 \(done) / \(total)"
                     }
                 }
             }.value
             issues = report.issues
+            completed = report.saved + report.skipped > 0
+            if completed && !reduceMotion {
+                UINotificationFeedbackGenerator().notificationOccurred(issues.isEmpty ? .success : .warning)
+            }
             status = "已导入 \(report.saved) 张，已跳过 \(report.skipped) 张。"
             if !issues.isEmpty { status += " 有 \(issues.count) 项需要检查。" }
             if report.saved + report.skipped == 0 && issues.isEmpty {
