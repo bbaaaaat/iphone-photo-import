@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import Photos
 import UniformTypeIdentifiers
 
@@ -22,12 +23,23 @@ struct ImportView: View {
                 Section {
                     Button("选择文件夹并导入") { picking = true }
                         .disabled(running)
+                    Button("导入 App 文件夹中的照片") {
+                        do {
+                            let folder = try FileManager.default.url(for: .documentDirectory,
+                                                                      in: .userDomainMask,
+                                                                      appropriateFor: nil, create: true)
+                            start(folder, needsScope: false)
+                        } catch {
+                            status = error.localizedDescription
+                        }
+                    }
+                    .disabled(running)
                     Text(status)
                     if running || progress > 0 {
                         ProgressView(value: progress)
                     }
                 } footer: {
-                    Text("会扫描子文件夹。导入时请保持 App 在前台。同一文件夹中已成功导入且未修改的文件会跳过。")
+                    Text("会扫描子文件夹。导入时请保持 App 在前台。如果「打开」无响应，可在「文件」中把照片文件夹复制到「我的 iPhone → 照片批量导入」，然后使用第二个按钮。")
                 }
                 if !issues.isEmpty {
                     Section("未导入的项目") {
@@ -39,17 +51,16 @@ struct ImportView: View {
             }
             .navigationTitle("照片批量导入")
         }
-        .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
-            switch result {
-            case .success(let folder):
-                start(folder)
-            case .failure(let error):
-                status = error.localizedDescription
+        .sheet(isPresented: $picking) {
+            FolderPicker { folder in
+                picking = false
+                if let folder { start(folder, needsScope: true) }
             }
+            .ignoresSafeArea()
         }
     }
 
-    private func start(_ folder: URL) {
+    private func start(_ folder: URL, needsScope: Bool) {
         running = true
         issues = []
         progress = 0
@@ -62,7 +73,7 @@ struct ImportView: View {
                 return
             }
             let report = await Task.detached(priority: .userInitiated) {
-                await Importer.run(folder: folder) { done, total in
+                await Importer.run(folder: folder, needsScope: needsScope) { done, total in
                     await MainActor.run {
                         progress = Double(done) / Double(max(total, 1))
                         status = "已处理 \(done) / \(total)"
@@ -75,6 +86,38 @@ struct ImportView: View {
             if report.saved + report.skipped == 0 && issues.isEmpty {
                 status = "这个文件夹没有找到可导入的图片。"
             }
+        }
+    }
+}
+
+struct FolderPicker: UIViewControllerRepresentable {
+    let finish: (URL?) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(finish: finish)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ picker: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let finish: (URL?) -> Void
+
+        init(finish: @escaping (URL?) -> Void) {
+            self.finish = finish
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            finish(urls.first)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            finish(nil)
         }
     }
 }
@@ -92,13 +135,14 @@ enum Importer {
         let identifier: String
     }
 
-    static func run(folder: URL, update: @Sendable (Int, Int) async -> Void) async -> Report {
+    static func run(folder: URL, needsScope: Bool, update: @Sendable (Int, Int) async -> Void) async -> Report {
         var report = Report()
-        guard folder.startAccessingSecurityScopedResource() else {
+        let scoped = needsScope && folder.startAccessingSecurityScopedResource()
+        guard !needsScope || scoped else {
             report.issues.append("无法访问所选文件夹。")
             return report
         }
-        defer { folder.stopAccessingSecurityScopedResource() }
+        defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
 
         let manager = FileManager.default
         let staging = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
