@@ -15,6 +15,7 @@ struct ImportApp: App {
 
 struct ImportView: View {
     @State private var picking = false
+    @State private var reviewingLibrary = false
     @State private var running = false
     @State private var status = "从「文件」把原始图片批量保存到系统照片。"
     @State private var progress = 0.0
@@ -66,6 +67,17 @@ struct ImportView: View {
                     .buttonStyle(.plain)
                     .disabled(running)
                     .opacity(running ? 0.5 : 1)
+                    Button {
+                        reviewingLibrary = true
+                    } label: {
+                        Label("相册去重", systemImage: "square.on.square")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding(15)
+                            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 17))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(running)
                     VStack(alignment: .leading, spacing: 8) {
                         Label("照片存放位置", systemImage: "folder.fill")
                             .font(.subheadline.weight(.semibold))
@@ -113,6 +125,7 @@ struct ImportView: View {
                 folderStatus = "创建目录失败：\(error.localizedDescription)"
             }
         }
+        .sheet(isPresented: $reviewingLibrary) { LibraryDuplicatesView() }
         .sheet(isPresented: $picking) {
             FolderPicker { folder in
                 picking = false
@@ -508,6 +521,310 @@ enum Importer {
                 if let video = photo.video {
                     add(video, as: .pairedVideo, to: asset)
                 }
+            }
+        }
+    }
+}
+
+struct LibraryDuplicatesView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var groups: [DuplicateGroup] = []
+    @State private var selected = Set<String>()
+    @State private var scanID: UUID?
+    @State private var status = "在本机查找文件内容完全相同的照片。"
+    @State private var scanned = 0
+    @State private var total = 0
+    @State private var scanning = false
+    @State private var deleting = false
+    @State private var confirming = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text(status)
+                    if scanning && total > 0 {
+                        ProgressView(value: Double(scanned), total: Double(total))
+                        Text("已检查 \(scanned) / \(total)").monospacedDigit()
+                    }
+                    Button("扫描相册") {
+                        groups = []
+                        selected = []
+                        scanned = 0
+                        total = 0
+                        scanning = true
+                        status = "正在准备扫描…"
+                        scanID = UUID()
+                    }
+                    .disabled(scanning || deleting)
+                } footer: {
+                    Text("仅检查设备上的原件。只存在于 iCloud 的照片会跳过。删除前可逐张勾选，每组至少保留一张。")
+                }
+                ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
+                    Section("第 \(index + 1) 组 · \(group.photos.count) 张") {
+                        ForEach(group.photos) { photo in
+                            let checked = selected.contains(photo.id)
+                            let groupSelection = group.photos.filter { selected.contains($0.id) }.count
+                            Button {
+                                if checked { selected.remove(photo.id) }
+                                else { selected.insert(photo.id) }
+                            } label: {
+                                PhotoReviewRow(photo: photo, checked: checked)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(deleting || (!checked && groupSelection >= group.photos.count - 1))
+                        }
+                    }
+                }
+            }
+            .navigationTitle("相册去重")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { dismiss() }.disabled(deleting)
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                if !groups.isEmpty {
+                    Button(role: .destructive) { confirming = true } label: {
+                        Text("删除选中的 \(selected.count) 张").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(selected.isEmpty || deleting)
+                    .padding()
+                    .background(.regularMaterial)
+                }
+            }
+            .alert("删除选中的 \(selected.count) 张照片？", isPresented: $confirming) {
+                Button("取消", role: .cancel) {}
+                Button("删除", role: .destructive) { Task { await deleteSelected() } }
+            } message: {
+                Text("系统会再次确认。这些照片会进入「最近删除」。")
+            }
+        }
+        .interactiveDismissDisabled(deleting)
+        .task(id: scanID) {
+            if scanID != nil { await scan() }
+        }
+    }
+
+    @MainActor
+    private func scan() async {
+        defer { scanning = false }
+        let access = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        guard access == .authorized || access == .limited else {
+            status = "请在系统设置里允许访问照片，再重新扫描。"
+            return
+        }
+        let limited = access == .limited
+        status = limited ? "正在扫描允许访问的照片…" : "正在检查本机照片…"
+        let worker = Task.detached(priority: .userInitiated) {
+            await LibraryDuplicateScanner.scan { done, count in
+                await MainActor.run {
+                    scanned = done
+                    total = count
+                }
+            }
+        }
+        let result = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+        guard !Task.isCancelled else { return }
+        groups = result.groups
+        status = groups.isEmpty ? "未发现完全相同的照片。" : "找到 \(groups.count) 组重复照片。"
+        if result.skipped > 0 { status += " 有 \(result.skipped) 张无法在本机读取原件，已跳过。" }
+        if limited { status += " 当前只扫描了你授权的照片。" }
+    }
+
+    @MainActor
+    private func deleteSelected() async {
+        guard !selected.isEmpty, !deleting else { return }
+        deleting = true
+        defer { deleting = false }
+        let requested = selected
+        let affected = groups.filter { group in group.photos.contains { requested.contains($0.id) } }
+        let expected = affected.flatMap { $0.photos }
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: expected.map(\.id), options: nil)
+        var current: [String: PHAsset] = [:]
+        assets.enumerateObjects { asset, _, _ in current[asset.localIdentifier] = asset }
+        guard expected.allSatisfy({ photo in
+            guard let asset = current[photo.id] else { return false }
+            return asset.modificationDate == photo.modified
+        }) else {
+            status = "相册有变化，请重新扫描后再选择。"
+            return
+        }
+        let targets = requested.compactMap { current[$0] }
+        guard targets.count == requested.count else { return }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.deleteAssets(targets as NSArray)
+            }
+            groups = groups.compactMap { group in
+                let remaining = group.photos.filter { !requested.contains($0.id) }
+                return remaining.count > 1 ? DuplicateGroup(id: group.id, photos: remaining) : nil
+            }
+            selected = []
+            status = "已删除 \(targets.count) 张。"
+        } catch {
+            let failure = error as NSError
+            if failure.domain == PHPhotosErrorDomain && failure.code == PHPhotosError.Code.userCancelled.rawValue {
+                status = "已取消删除。"
+            } else {
+                status = "未删除照片。\(error.localizedDescription)"
+            }
+        }
+    }
+}
+
+struct PhotoReviewRow: View {
+    let photo: DuplicatePhoto
+    let checked: Bool
+    @State private var thumbnail: UIImage?
+    @State private var request: PHImageRequestID?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 9).fill(.quaternary)
+                if let thumbnail {
+                    Image(uiImage: thumbnail).resizable().scaledToFill()
+                } else {
+                    Image(systemName: "photo").foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 58, height: 58)
+            .clipShape(RoundedRectangle(cornerRadius: 9))
+            .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(photo.filename).lineLimit(2)
+                if let date = photo.created {
+                    Text(date.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if photo.favorite || photo.live {
+                    HStack {
+                        if photo.favorite { Label("收藏", systemImage: "heart.fill") }
+                        if photo.live { Label("实况", systemImage: "livephoto") }
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Image(systemName: checked ? "checkmark.circle.fill" : "circle")
+                .font(.title3)
+                .foregroundStyle(checked ? Color.accentColor : Color.secondary)
+        }
+        .contentShape(Rectangle())
+        .accessibilityAddTraits(checked ? .isSelected : [])
+        .onAppear {
+            guard thumbnail == nil, request == nil,
+                  let asset = PHAsset.fetchAssets(withLocalIdentifiers: [photo.id], options: nil).firstObject else { return }
+            let options = PHImageRequestOptions()
+            options.isNetworkAccessAllowed = false
+            options.deliveryMode = .opportunistic
+            request = PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 180, height: 180),
+                                                            contentMode: .aspectFill, options: options) { image, _ in
+                guard let image else { return }
+                DispatchQueue.main.async { thumbnail = image }
+            }
+        }
+        .onDisappear {
+            if let request { PHImageManager.default().cancelImageRequest(request) }
+            request = nil
+        }
+    }
+}
+
+struct DuplicatePhoto: Identifiable, Sendable {
+    let id: String
+    let filename: String
+    let created: Date?
+    let modified: Date?
+    let favorite: Bool
+    let live: Bool
+}
+
+struct DuplicateGroup: Identifiable, Sendable {
+    let id: String
+    let photos: [DuplicatePhoto]
+}
+
+enum LibraryDuplicateScanner {
+    struct Result: Sendable {
+        let groups: [DuplicateGroup]
+        let skipped: Int
+    }
+
+    static func scan(update: @Sendable (Int, Int) async -> Void) async -> Result {
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+        let assets = PHAsset.fetchAssets(with: .image, options: options)
+        var matches: [String: [DuplicatePhoto]] = [:]
+        var skipped = 0
+        await update(0, assets.count)
+        for index in 0..<assets.count {
+            if Task.isCancelled { break }
+            let asset = assets.object(at: index)
+            let resources = PHAssetResource.assetResources(for: asset)
+            if let original = resources.first(where: { $0.type == .photo }) {
+                do {
+                    var keys: [String] = []
+                    for resource in resources {
+                        try Task.checkCancellation()
+                        keys.append("\(resource.type.rawValue):\(try await hash(resource))")
+                    }
+                    let live = asset.mediaSubtypes.contains(.photoLive)
+                    let key = "\(live):" + keys.sorted().joined(separator: "|")
+                    matches[key, default: []].append(DuplicatePhoto(id: asset.localIdentifier,
+                        filename: original.originalFilename, created: asset.creationDate,
+                        modified: asset.modificationDate, favorite: asset.isFavorite, live: live))
+                } catch {
+                    skipped += 1
+                }
+            } else {
+                skipped += 1
+            }
+            if (index + 1).isMultiple(of: 16) || index + 1 == assets.count {
+                await update(index + 1, assets.count)
+            }
+        }
+        let groups = matches.compactMap { key, photos in
+            photos.count > 1 ? DuplicateGroup(id: key, photos: photos) : nil
+        }.sorted { ($0.photos.first?.created ?? .distantPast, $0.id) < ($1.photos.first?.created ?? .distantPast, $1.id) }
+        return Result(groups: groups, skipped: skipped)
+    }
+
+    private final class ResourceDigest: @unchecked Sendable {
+        private let lock = NSLock()
+        private var state = SHA256()
+
+        func append(_ data: Data) {
+            lock.lock()
+            defer { lock.unlock() }
+            state.update(data: data)
+        }
+
+        func finish() -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            return Data(state.finalize()).base64EncodedString()
+        }
+    }
+
+    private static func hash(_ resource: PHAssetResource) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            let options = PHAssetResourceRequestOptions()
+            options.isNetworkAccessAllowed = false
+            let digest = ResourceDigest()
+            PHAssetResourceManager.default().requestData(for: resource, options: options,
+                                                        dataReceivedHandler: { digest.append($0) }) { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume(returning: digest.finish()) }
             }
         }
     }
