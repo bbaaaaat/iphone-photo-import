@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import AVFoundation
 import ImageIO
+import CryptoKit
 import Photos
 import UniformTypeIdentifiers
 
@@ -221,7 +222,7 @@ struct ImportView: View {
             if completed && !reduceMotion {
                 UINotificationFeedbackGenerator().notificationOccurred(issues.isEmpty ? .success : .warning)
             }
-            status = "已导入 \(report.saved) 张，已跳过 \(report.skipped) 张。"
+            status = "已导入 \(report.saved) 张，已跳过 \(report.skipped) 张重复照片。"
             if report.live > 0 { status += " 含 \(report.live) 张实况照片。" }
             if !issues.isEmpty { status += " 有 \(issues.count) 项需要检查。" }
             if report.saved + report.skipped == 0 && issues.isEmpty {
@@ -281,6 +282,7 @@ enum Importer {
         let still: StagedResource
         let video: StagedResource?
         let liveIdentifier: String?
+        let contentIdentifier: String
     }
 
     static func run(folder: URL, needsScope: Bool, update: @Sendable (Int, Int) async -> Void) async -> Report {
@@ -349,6 +351,9 @@ enum Importer {
             for offset in stride(from: 0, to: files.count, by: 16) {
                 let end = min(offset + 16, files.count)
                 var batch: [StagedPhoto] = []
+                var pending = Set<String>()
+                var duplicates: [(source: URL, identifier: String)] = []
+                let previousRecordCount = imported.count
                 for source in files[offset..<end] {
                     do {
                         var still: StagedResource?
@@ -364,16 +369,17 @@ enum Importer {
                                let id = maker["17"] as? String {
                                 movie = pairedMovies[id.lowercased()]
                             }
-                            if movie == nil && imported.contains(stillID) {
-                                report.skipped += 1
-                                return
-                            }
                             still = try stage(source: source, readable: readable, identifier: stillID, in: staging)
                         }
                         guard let still else { continue }
                         var retained = false
-                        defer { if !retained { try? manager.removeItem(at: still.copy) } }
                         var video: StagedResource?
+                        defer {
+                            if !retained {
+                                try? manager.removeItem(at: still.copy)
+                                if let video { try? manager.removeItem(at: video.copy) }
+                            }
+                        }
                         if let movie {
                             try coordinate(movie) { readable in
                                 let values = try readable.resourceValues(forKeys: keys)
@@ -382,12 +388,27 @@ enum Importer {
                             }
                         }
                         let liveIdentifier = video.map { "live\n\(still.identifier)\n\($0.identifier)" }
-                        if let liveIdentifier, imported.contains(liveIdentifier) {
+                        let stillHash = try contentHash(still.copy)
+                        let contentIdentifier: String
+                        if let video {
+                            contentIdentifier = "live-sha256:\(stillHash):\(try contentHash(video.copy))"
+                        } else {
+                            contentIdentifier = "photo-sha256:\(stillHash)"
+                        }
+                        // Older imports only recorded the file path, size and modification date.
+                        if imported.contains(liveIdentifier ?? still.identifier) {
+                            imported.insert(contentIdentifier)
+                        }
+                        if imported.contains(contentIdentifier) {
                             report.skipped += 1
-                            if let video { try? manager.removeItem(at: video.copy) }
                             continue
                         }
-                        batch.append(StagedPhoto(still: still, video: video, liveIdentifier: liveIdentifier))
+                        guard pending.insert(contentIdentifier).inserted else {
+                            duplicates.append((source, contentIdentifier))
+                            continue
+                        }
+                        batch.append(StagedPhoto(still: still, video: video, liveIdentifier: liveIdentifier,
+                                                 contentIdentifier: contentIdentifier))
                         retained = true
                     } catch {
                         report.issues.append("\(source.lastPathComponent) · \(error.localizedDescription)")
@@ -395,12 +416,14 @@ enum Importer {
                 }
 
                 if !batch.isEmpty {
+                    let candidates = batch.filter { !imported.contains($0.contentIdentifier) }
+                    report.skipped += batch.count - candidates.count
                     var saved: [StagedPhoto] = []
                     do {
-                        try save(batch)
-                        saved = batch
+                        if !candidates.isEmpty { try save(candidates) }
+                        saved = candidates
                     } catch {
-                        for photo in batch {
+                        for photo in candidates {
                             do {
                                 try save([photo])
                                 saved.append(photo)
@@ -411,17 +434,25 @@ enum Importer {
                     }
                     report.saved += saved.count
                     for photo in saved {
-                        imported.insert(photo.still.identifier)
-                        if let liveIdentifier = photo.liveIdentifier {
+                        imported.insert(photo.contentIdentifier)
+                        if photo.liveIdentifier != nil {
                             report.live += 1
-                            imported.insert(liveIdentifier)
                         }
                     }
-                    try JSONEncoder().encode(imported).write(to: journal, options: .atomic)
                     for photo in batch {
                         try? manager.removeItem(at: photo.still.copy)
                         if let video = photo.video { try? manager.removeItem(at: video.copy) }
                     }
+                }
+                for duplicate in duplicates {
+                    if imported.contains(duplicate.identifier) {
+                        report.skipped += 1
+                    } else {
+                        report.issues.append("\(duplicate.source.lastPathComponent) · 相同内容的文件导入失败")
+                    }
+                }
+                if imported.count != previousRecordCount {
+                    try JSONEncoder().encode(imported).write(to: journal, options: .atomic)
                 }
                 await update(end, files.count)
             }
@@ -440,6 +471,16 @@ enum Importer {
         }
         if let coordinationError { throw coordinationError }
         if let readError { throw readError }
+    }
+
+    private static func contentHash(_ url: URL) throws -> String {
+        let file = try FileHandle(forReadingFrom: url)
+        defer { try? file.close() }
+        var hash = SHA256()
+        while let chunk = try file.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+            hash.update(data: chunk)
+        }
+        return Data(hash.finalize()).base64EncodedString()
     }
 
     private static func fingerprint(_ source: URL, _ values: URLResourceValues) -> String {
