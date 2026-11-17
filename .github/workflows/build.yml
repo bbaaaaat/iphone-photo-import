@@ -1,0 +1,25 @@
+name: Build iPhone IPA
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for iPhone
+        run: |
+          xcodebuild -project PhotoImport.xcodeproj -target PhotoImport \
+            -configuration Release -sdk iphoneos ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO CONFIGURATION_BUILD_DIR="$PWD/build"
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/PhotoImport.app Payload/
+          /usr/libexec/PlistBuddy -c 'Print :NSPhotoLibraryAddUsageDescription' Payload/PhotoImport.app/Info.plist
+          /usr/bin/zip -qry PhotoImport-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoImport-unsigned
+          path: PhotoImport-unsigned.ipa
+          if-no-files-found: error
