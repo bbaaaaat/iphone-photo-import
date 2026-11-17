@@ -1,5 +1,7 @@
 import SwiftUI
 import UIKit
+import AVFoundation
+import ImageIO
 import Photos
 import UniformTypeIdentifiers
 
@@ -220,6 +222,7 @@ struct ImportView: View {
                 UINotificationFeedbackGenerator().notificationOccurred(issues.isEmpty ? .success : .warning)
             }
             status = "已导入 \(report.saved) 张，已跳过 \(report.skipped) 张。"
+            if report.live > 0 { status += " 含 \(report.live) 张实况照片。" }
             if !issues.isEmpty { status += " 有 \(issues.count) 项需要检查。" }
             if report.saved + report.skipped == 0 && issues.isEmpty {
                 status = "这个文件夹没有找到可导入的图片。"
@@ -263,14 +266,21 @@ struct FolderPicker: UIViewControllerRepresentable {
 enum Importer {
     struct Report: Sendable {
         var saved = 0
+        var live = 0
         var skipped = 0
         var issues: [String] = []
     }
 
-    struct StagedPhoto {
+    struct StagedResource {
         let source: URL
         let copy: URL
         let identifier: String
+    }
+
+    struct StagedPhoto {
+        let still: StagedResource
+        let video: StagedResource?
+        let liveIdentifier: String?
     }
 
     static func run(folder: URL, needsScope: Bool, update: @Sendable (Int, Int) async -> Void) async -> Report {
@@ -297,6 +307,7 @@ enum Importer {
 
             let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
             var files: [URL] = []
+            var movies: [URL] = []
             try coordinate(folder) { directory in
                 guard let children = manager.enumerator(at: directory, includingPropertiesForKeys: Array(keys),
                                                         options: [.skipsHiddenFiles, .skipsPackageDescendants],
@@ -306,12 +317,33 @@ enum Importer {
                 }) else {
                     throw CocoaError(.fileReadUnknown)
                 }
-                files = children.compactMap { entry in
-                    guard let url = entry as? URL,
-                          let type = UTType(filenameExtension: url.pathExtension),
-                          type.conforms(to: .image) else { return nil }
-                    return url
-                }.sorted { $0.path < $1.path }
+                for entry in children {
+                    guard let url = entry as? URL else { continue }
+                    if url.pathExtension.lowercased() == "mov" {
+                        movies.append(url)
+                    } else if let type = UTType(filenameExtension: url.pathExtension), type.conforms(to: .image) {
+                        files.append(url)
+                    }
+                }
+            }
+            files.sort { $0.path < $1.path }
+
+            // Match original assets by their embedded ID, even when export renamed the files.
+            var pairedMovies: [String: URL] = [:]
+            if !files.isEmpty {
+                for movie in movies.sorted(by: { $0.path < $1.path }) {
+                    do {
+                        try coordinate(movie) { readable in
+                            let metadata = AVURLAsset(url: readable).metadata(forFormat: .quickTimeMetadata)
+                            if let id = metadata.first(where: { $0.identifier == .quickTimeMetadataContentIdentifier })?.stringValue,
+                               !id.isEmpty, pairedMovies[id.lowercased()] == nil {
+                                pairedMovies[id.lowercased()] = movie
+                            }
+                        }
+                    } catch {
+                        report.issues.append("\(movie.lastPathComponent) · \(error.localizedDescription)")
+                    }
+                }
             }
 
             for offset in stride(from: 0, to: files.count, by: 16) {
@@ -319,19 +351,44 @@ enum Importer {
                 var batch: [StagedPhoto] = []
                 for source in files[offset..<end] {
                     do {
+                        var still: StagedResource?
+                        var movie: URL?
                         try coordinate(source) { readable in
                             let values = try readable.resourceValues(forKeys: keys)
                             guard values.isRegularFile == true else { return }
-                            let identifier = "\(source.path)\n\(values.fileSize ?? 0)\n\(values.contentModificationDate?.timeIntervalSince1970 ?? 0)"
-                            if imported.contains(identifier) {
+                            let stillID = fingerprint(source, values)
+                            if !pairedMovies.isEmpty,
+                               let image = CGImageSourceCreateWithURL(readable as CFURL, nil),
+                               let properties = CGImageSourceCopyPropertiesAtIndex(image, 0, nil) as NSDictionary?,
+                               let maker = properties[kCGImagePropertyMakerAppleDictionary] as? NSDictionary,
+                               let id = maker["17"] as? String {
+                                movie = pairedMovies[id.lowercased()]
+                            }
+                            if movie == nil && imported.contains(stillID) {
                                 report.skipped += 1
                                 return
                             }
-                            let copy = staging.appendingPathComponent(UUID().uuidString)
-                                .appendingPathExtension(source.pathExtension)
-                            try manager.copyItem(at: readable, to: copy)
-                            batch.append(StagedPhoto(source: source, copy: copy, identifier: identifier))
+                            still = try stage(source: source, readable: readable, identifier: stillID, in: staging)
                         }
+                        guard let still else { continue }
+                        var retained = false
+                        defer { if !retained { try? manager.removeItem(at: still.copy) } }
+                        var video: StagedResource?
+                        if let movie {
+                            try coordinate(movie) { readable in
+                                let values = try readable.resourceValues(forKeys: keys)
+                                video = try stage(source: movie, readable: readable,
+                                                  identifier: fingerprint(movie, values), in: staging)
+                            }
+                        }
+                        let liveIdentifier = video.map { "live\n\(still.identifier)\n\($0.identifier)" }
+                        if let liveIdentifier, imported.contains(liveIdentifier) {
+                            report.skipped += 1
+                            if let video { try? manager.removeItem(at: video.copy) }
+                            continue
+                        }
+                        batch.append(StagedPhoto(still: still, video: video, liveIdentifier: liveIdentifier))
+                        retained = true
                     } catch {
                         report.issues.append("\(source.lastPathComponent) · \(error.localizedDescription)")
                     }
@@ -348,14 +405,23 @@ enum Importer {
                                 try save([photo])
                                 saved.append(photo)
                             } catch {
-                                report.issues.append("\(photo.source.lastPathComponent) · \(error.localizedDescription)")
+                                report.issues.append("\(photo.still.source.lastPathComponent) · \(error.localizedDescription)")
                             }
                         }
                     }
                     report.saved += saved.count
-                    imported.formUnion(saved.map(\.identifier))
+                    for photo in saved {
+                        imported.insert(photo.still.identifier)
+                        if let liveIdentifier = photo.liveIdentifier {
+                            report.live += 1
+                            imported.insert(liveIdentifier)
+                        }
+                    }
                     try JSONEncoder().encode(imported).write(to: journal, options: .atomic)
-                    for photo in batch { try? manager.removeItem(at: photo.copy) }
+                    for photo in batch {
+                        try? manager.removeItem(at: photo.still.copy)
+                        if let video = photo.video { try? manager.removeItem(at: video.copy) }
+                    }
                 }
                 await update(end, files.count)
             }
@@ -376,12 +442,31 @@ enum Importer {
         if let readError { throw readError }
     }
 
+    private static func fingerprint(_ source: URL, _ values: URLResourceValues) -> String {
+        "\(source.path)\n\(values.fileSize ?? 0)\n\(values.contentModificationDate?.timeIntervalSince1970 ?? 0)"
+    }
+
+    private static func stage(source: URL, readable: URL, identifier: String, in directory: URL) throws -> StagedResource {
+        let copy = directory.appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(source.pathExtension)
+        try FileManager.default.copyItem(at: readable, to: copy)
+        return StagedResource(source: source, copy: copy, identifier: identifier)
+    }
+
+    private static func add(_ resource: StagedResource, as type: PHAssetResourceType, to asset: PHAssetCreationRequest) {
+        let options = PHAssetResourceCreationOptions()
+        options.originalFilename = resource.source.lastPathComponent
+        asset.addResource(with: type, fileURL: resource.copy, options: options)
+    }
+
     private static func save(_ photos: [StagedPhoto]) throws {
         try PHPhotoLibrary.shared().performChangesAndWait {
             for photo in photos {
-                let options = PHAssetResourceCreationOptions()
-                options.originalFilename = photo.source.lastPathComponent
-                PHAssetCreationRequest.forAsset().addResource(with: .photo, fileURL: photo.copy, options: options)
+                let asset = PHAssetCreationRequest.forAsset()
+                add(photo.still, as: .photo, to: asset)
+                if let video = photo.video {
+                    add(video, as: .pairedVideo, to: asset)
+                }
             }
         }
     }
