@@ -13,8 +13,25 @@ struct ImportApp: App {
     }
 }
 
+
+enum AppPalette {
+    static let background = adaptive(light: 0xF4F7F4, dark: 0x0D1C19)
+    static let card = adaptive(light: 0xFFFFFF, dark: 0x172D26)
+    static let hero = adaptive(light: 0xE1F2E8, dark: 0x213F33)
+    static let accent = adaptive(light: 0x6ADCA0, dark: 0xA6F5C5)
+    static let border = adaptive(light: 0xDCE7E0, dark: 0x345346)
+
+    private static func adaptive(light: UInt32, dark: UInt32) -> Color {
+        Color(UIColor { traits in
+            let value = traits.userInterfaceStyle == .dark ? dark : light
+            return UIColor(red: CGFloat((value >> 16) & 255) / 255,
+                           green: CGFloat((value >> 8) & 255) / 255,
+                           blue: CGFloat(value & 255) / 255, alpha: 1)
+        })
+    }
+}
+
 struct ImportView: View {
-    @State private var picking = false
     @State private var reviewingLibrary = false
     @State private var running = false
     @State private var status = "从「文件」批量保存照片和视频到系统相册。"
@@ -26,12 +43,12 @@ struct ImportView: View {
     @State private var measured = false
     @State private var completed = false
 
-    private let mint = Color(red: 0.65, green: 0.96, blue: 0.77)
+    private var mint: Color { AppPalette.accent }
     private let ink = Color(red: 0.05, green: 0.11, blue: 0.10)
 
     var body: some View {
         ZStack {
-            ink.ignoresSafeArea()
+            AppPalette.background.ignoresSafeArea()
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     HStack {
@@ -54,15 +71,7 @@ struct ImportView: View {
                                 .foregroundStyle(ink)
                                 .background(mint, in: RoundedRectangle(cornerRadius: 17))
                         }
-                        Button {
-                            picking = true
-                        } label: {
-                            Label("从「文件」选择其他文件夹", systemImage: "folder")
-                                .font(.subheadline.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                                .padding(15)
-                                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 17))
-                        }
+
                     }
                     .buttonStyle(.plain)
                     .disabled(running)
@@ -74,7 +83,7 @@ struct ImportView: View {
                             .font(.headline)
                             .frame(maxWidth: .infinity)
                             .padding(15)
-                            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 17))
+                            .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 17))
                     }
                     .buttonStyle(.plain)
                     .disabled(running)
@@ -104,8 +113,8 @@ struct ImportView: View {
                 .frame(maxWidth: .infinity)
             }
         }
-        .foregroundStyle(.white)
-        .preferredColorScheme(.dark)
+        .foregroundStyle(.primary)
+        .tint(AppPalette.accent)
         .onAppear {
             do {
                 let documents = try FileManager.default.url(for: .documentDirectory,
@@ -126,13 +135,7 @@ struct ImportView: View {
             }
         }
         .sheet(isPresented: $reviewingLibrary) { LibraryDuplicatesView() }
-        .sheet(isPresented: $picking) {
-            FolderPicker { folder in
-                picking = false
-                if let folder { start(folder, needsScope: true) }
-            }
-            .ignoresSafeArea()
-        }
+
     }
 
     private var hero: some View {
@@ -188,7 +191,7 @@ struct ImportView: View {
         .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            LinearGradient(colors: [Color(red: 0.13, green: 0.28, blue: 0.23), Color(red: 0.08, green: 0.18, blue: 0.16)],
+            LinearGradient(colors: [AppPalette.hero, AppPalette.card],
                            startPoint: .topLeading, endPoint: .bottomTrailing),
             in: RoundedRectangle(cornerRadius: 29)
         )
@@ -241,38 +244,6 @@ struct ImportView: View {
             if report.saved + report.skipped == 0 && issues.isEmpty {
                 status = "这个文件夹没有找到可导入的照片或视频。"
             }
-        }
-    }
-}
-
-struct FolderPicker: UIViewControllerRepresentable {
-    let finish: (URL?) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(finish: finish)
-    }
-
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_ picker: UIDocumentPickerViewController, context: Context) {}
-
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let finish: (URL?) -> Void
-
-        init(finish: @escaping (URL?) -> Void) {
-            self.finish = finish
-        }
-
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            finish(urls.first)
-        }
-
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            finish(nil)
         }
     }
 }
@@ -558,52 +529,104 @@ struct LibraryDuplicatesView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    Text(status)
-                    if scanning && total > 0 {
-                        ProgressView(value: Double(scanned), total: Double(total))
-                        Text("已检查 \(scanned) / \(total)").monospacedDigit()
-                    }
-                    Button("扫描相册") {
-                        groups = []
-                        selected = []
-                        scanned = 0
-                        total = 0
-                        scanning = true
-                        status = "正在准备扫描…"
-                        scanID = UUID()
-                    }
-                    .disabled(scanning || deleting)
-                    if !groups.isEmpty {
-                        Button(selected == suggestedSelection ? "清空勾选" : "一键勾选") {
-                            selected = selected == suggestedSelection ? [] : suggestedSelection
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Image(systemName: scanning ? "viewfinder" : "square.on.square")
+                            .font(.system(size: 28, weight: .medium))
+                            .foregroundStyle(AppPalette.accent)
+                            .padding(14)
+                            .background(AppPalette.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 18))
+                        Text(scanning ? "正在寻找重复内容" : "让相册轻一点")
+                            .font(.system(.title, design: .rounded, weight: .bold))
+                        Text(status).font(.subheadline).foregroundStyle(.secondary)
+                        if scanning {
+                            if total > 0 {
+                                ProgressView(value: Double(scanned), total: Double(total))
+                                Text("已检查 \(scanned) / \(total)")
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            } else { ProgressView() }
                         }
+                        Button {
+                            groups = []
+                            selected = []
+                            scanned = 0
+                            total = 0
+                            scanning = true
+                            status = "正在准备扫描…"
+                            scanID = UUID()
+                        } label: {
+                            Label(scanning ? "扫描中…" : "扫描相册", systemImage: "viewfinder")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(15)
+                                .background(AppPalette.accent, in: RoundedRectangle(cornerRadius: 16))
+                                .foregroundStyle(Color(red: 0.04, green: 0.15, blue: 0.11))
+                        }
+                        .buttonStyle(.plain)
                         .disabled(scanning || deleting)
-                        Text("每组优先保留收藏的项目，其次保留拍摄最早的一项。")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
                     }
-                } footer: {
-                    Text("仅检查设备上的原件。只存在于 iCloud 的照片会跳过。删除前可逐张勾选，每组至少保留一张。")
-                }
-                ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
-                    Section("第 \(index + 1) 组 · \(group.photos.count) 张") {
-                        ForEach(group.photos) { photo in
-                            let checked = selected.contains(photo.id)
-                            let groupSelection = group.photos.filter { selected.contains($0.id) }.count
-                            Button {
-                                if checked { selected.remove(photo.id) }
-                                else { selected.insert(photo.id) }
-                            } label: {
-                                PhotoReviewRow(photo: photo, checked: checked)
+                    .padding(22)
+                    .background(AppPalette.hero, in: RoundedRectangle(cornerRadius: 26))
+
+                    if !groups.isEmpty {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("\(groups.count) 组重复项目").font(.headline)
+                                Text("已选 \(selected.count) 个")
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                             }
-                            .buttonStyle(.plain)
-                            .disabled(deleting || (!checked && groupSelection >= group.photos.count - 1))
+                            Spacer()
+                            Button(selected == suggestedSelection ? "清空勾选" : "一键勾选") {
+                                selected = selected == suggestedSelection ? [] : suggestedSelection
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(scanning || deleting)
                         }
+                        Text("每组优先保留收藏的项目，其次保留拍摄最早的一项。")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
+
+                    ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack {
+                                Text("重复组 \(index + 1)").font(.headline)
+                                Spacer()
+                                Text("\(group.photos.count) 个项目")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            ForEach(group.photos) { photo in
+                                let checked = selected.contains(photo.id)
+                                let groupSelection = group.photos.filter { selected.contains($0.id) }.count
+                                Button {
+                                    if checked { selected.remove(photo.id) }
+                                    else { selected.insert(photo.id) }
+                                } label: {
+                                    PhotoReviewRow(photo: photo, checked: checked)
+                                        .padding(12)
+                                        .background(checked ? AppPalette.accent.opacity(0.10) : Color.clear,
+                                                    in: RoundedRectangle(cornerRadius: 16))
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 16)
+                                                .strokeBorder(checked ? AppPalette.accent.opacity(0.65) : AppPalette.border)
+                                        }
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(deleting || (!checked && groupSelection >= group.photos.count - 1))
+                            }
+                        }
+                        .padding(18)
+                        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 24))
+                    }
+                    Label("仅扫描本机原件 · 每组至少保留一项", systemImage: "iphone")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: 600)
+                .padding(20)
+                .frame(maxWidth: .infinity)
             }
+            .background(AppPalette.background.ignoresSafeArea())
+            .tint(AppPalette.accent)
             .navigationTitle("相册去重")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -616,7 +639,8 @@ struct LibraryDuplicatesView: View {
                     Button(role: .destructive) { confirming = true } label: {
                         Text("删除选中的 \(selected.count) 个").frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
                     .disabled(selected.isEmpty || deleting)
                     .padding()
                     .background(.regularMaterial)
@@ -729,7 +753,7 @@ struct PhotoReviewRow: View {
                     Image(systemName: "photo").foregroundStyle(.secondary)
                 }
             }
-            .frame(width: 58, height: 58)
+            .frame(width: 76, height: 76)
             .clipShape(RoundedRectangle(cornerRadius: 9))
             .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
