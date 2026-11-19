@@ -902,29 +902,99 @@ enum LibraryDuplicateScanner {
     }
 }
 
+
+@MainActor
+final class ThumbnailFlow: ObservableObject {
+    struct Flight: Identifiable {
+        let id = UUID()
+        let image: UIImage
+        let started: TimeInterval
+    }
+
+    @Published private(set) var flights: [Flight] = []
+    @Published private(set) var ready: [UIImage] = []
+    private var requested: [String: PHImageRequestID] = [:]
+    private var images: [String: UIImage] = [:]
+    private var desired: [String] = []
+    private var cursor = 0
+
+    func update(_ identifiers: [String]) {
+        desired = Array(identifiers.suffix(4))
+        let keep = Set(desired)
+        for key in Array(requested.keys) where !keep.contains(key) {
+            if let request = requested.removeValue(forKey: key) {
+                PHImageManager.default().cancelImageRequest(request)
+            }
+        }
+        images = images.filter { keep.contains($0.key) }
+        refreshReady()
+        for identifier in desired where images[identifier] == nil && requested[identifier] == nil {
+            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else { continue }
+            let options = PHImageRequestOptions()
+            options.isNetworkAccessAllowed = false
+            options.deliveryMode = .fastFormat
+            let request = PHImageManager.default().requestImage(
+                for: asset, targetSize: CGSize(width: 136, height: 136),
+                contentMode: .aspectFill, options: options
+            ) { [weak self] image, _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.desired.contains(identifier), let image else { return }
+                    self.images[identifier] = image
+                    self.refreshReady()
+                }
+            }
+            requested[identifier] = request
+        }
+    }
+
+    private func refreshReady() {
+        let next = desired.compactMap { images[$0] }
+        // Keep the last loaded set until replacements are ready.
+        if !next.isEmpty { ready = next }
+    }
+
+    func advance() {
+        let now = ProcessInfo.processInfo.systemUptime
+        flights.removeAll { now - $0.started >= 3.8 }
+        guard !ready.isEmpty else { return }
+        let image = ready[cursor % ready.count]
+        cursor = (cursor + 1) % ready.count
+        flights.append(Flight(image: image, started: now))
+    }
+
+    func stop() {
+        for request in requested.values { PHImageManager.default().cancelImageRequest(request) }
+        requested = [:]
+        images = [:]
+        desired = []
+        ready = []
+        flights = []
+    }
+}
+
 struct ScanningThumbnails: View {
     let identifiers: [String]
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var flow = ThumbnailFlow()
 
     var body: some View {
         GeometryReader { geometry in
             if reduceMotion {
                 HStack(spacing: 10) {
-                    ForEach(identifiers, id: \.self) { identifier in
-                        ScanThumbnail(identifier: identifier)
+                    ForEach(Array(flow.ready.enumerated()), id: \.offset) { _, image in
+                        thumbnail(image)
                     }
                 }
                 .frame(maxWidth: .infinity)
             } else {
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
-                    let time = context.date.timeIntervalSinceReferenceDate
+                TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { _ in
+                    let now = ProcessInfo.processInfo.systemUptime
                     ZStack(alignment: .leading) {
-                        ForEach(Array(identifiers.enumerated()), id: \.element) { index, identifier in
-                            let phase = (time / 3.2 + Double(index) / 4)
-                                .truncatingRemainder(dividingBy: 1)
-                            ScanThumbnail(identifier: identifier)
-                                .opacity(min(1, min(phase / 0.16, (1 - phase) / 0.20)))
-                                .offset(x: CGFloat(phase) * (geometry.size.width + 76) - 76)
+                        ForEach(flow.flights) { flight in
+                            let phase = min(1, max(0, (now - flight.started) / 3.8))
+                            thumbnail(flight.image)
+                                .opacity(min(1, min(phase / 0.14, (1 - phase) / 0.18)))
+                                .offset(x: CGFloat(phase) * (geometry.size.width + 84) - 76)
                         }
                     }
                     .frame(width: geometry.size.width, height: 76, alignment: .leading)
@@ -934,42 +1004,25 @@ struct ScanningThumbnails: View {
         .frame(height: 76)
         .clipped()
         .accessibilityHidden(true)
+        .onAppear { flow.update(identifiers) }
+        .onChange(of: identifiers) { flow.update($0) }
+        .task(id: reduceMotion) {
+            guard !reduceMotion else { return }
+            while !Task.isCancelled {
+                flow.advance()
+                do { try await Task.sleep(nanoseconds: 850_000_000) }
+                catch { return }
+            }
+        }
+        .onDisappear { flow.stop() }
     }
-}
 
-struct ScanThumbnail: View {
-    let identifier: String
-    @State private var image: UIImage?
-    @State private var request: PHImageRequestID?
-
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 14).fill(AppPalette.accent.opacity(0.12))
-            if let image {
-                Image(uiImage: image).resizable().scaledToFill()
-            } else {
-                Image(systemName: "photo").foregroundStyle(AppPalette.accent)
-            }
-        }
-        .frame(width: 68, height: 68)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(AppPalette.border) }
-        .onAppear {
-            guard request == nil,
-                  let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else { return }
-            let options = PHImageRequestOptions()
-            options.isNetworkAccessAllowed = false
-            options.deliveryMode = .fastFormat
-            request = PHImageManager.default().requestImage(
-                for: asset, targetSize: CGSize(width: 136, height: 136),
-                contentMode: .aspectFill, options: options
-            ) { thumbnail, _ in
-                DispatchQueue.main.async { image = thumbnail }
-            }
-        }
-        .onDisappear {
-            if let request { PHImageManager.default().cancelImageRequest(request) }
-            request = nil
-        }
+    private func thumbnail(_ image: UIImage) -> some View {
+        Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+            .frame(width: 68, height: 68)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(AppPalette.border) }
     }
 }
