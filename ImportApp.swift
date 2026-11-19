@@ -522,6 +522,8 @@ struct LibraryDuplicatesView: View {
     @State private var scanID: UUID?
     @State private var status = "在本机查找文件内容完全相同的照片和视频。"
     @State private var thumbnailIDs: [String] = []
+    @State private var candidateIDs: [String] = []
+    @State private var candidateCount = 0
     @State private var scanned = 0
     @State private var total = 0
     @State private var scanning = false
@@ -542,7 +544,7 @@ struct LibraryDuplicatesView: View {
                             .font(.system(.title, design: .rounded, weight: .bold))
                         Text(status).font(.subheadline).foregroundStyle(.secondary)
                         if scanning {
-                            ScanningThumbnails(identifiers: thumbnailIDs)
+                            ScanningThumbnails(identifiers: thumbnailIDs, candidates: candidateIDs, candidateCount: candidateCount)
                             if total > 0 {
                                 ProgressView(value: Double(scanned), total: Double(total))
                                 Text("已检查 \(scanned) / \(total)")
@@ -553,6 +555,8 @@ struct LibraryDuplicatesView: View {
                             groups = []
                             selected = []
                             thumbnailIDs = []
+                            candidateIDs = []
+                            candidateCount = 0
                             scanned = 0
                             total = 0
                             scanning = true
@@ -680,9 +684,11 @@ struct LibraryDuplicatesView: View {
         let limited = access == .limited
         status = limited ? "正在扫描允许访问的照片…" : "正在检查本机照片…"
         let worker = Task.detached(priority: .userInitiated) {
-            await LibraryDuplicateScanner.scan { done, count, identifiers in
+            await LibraryDuplicateScanner.scan { done, count, identifiers, candidates, duplicateCount in
                 await MainActor.run {
                     thumbnailIDs = identifiers
+                    candidateIDs = candidates
+                    candidateCount = duplicateCount
                     scanned = done
                     total = count
                 }
@@ -824,7 +830,7 @@ enum LibraryDuplicateScanner {
         let skipped: Int
     }
 
-    static func scan(update: @Sendable (Int, Int, [String]) async -> Void) async -> Result {
+    static func scan(update: @Sendable (Int, Int, [String], [String], Int) async -> Void) async -> Result {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         options.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d",
@@ -832,14 +838,16 @@ enum LibraryDuplicateScanner {
         let assets = PHAsset.fetchAssets(with: options)
         var matches: [String: [DuplicatePhoto]] = [:]
         var skipped = 0
-        await update(0, assets.count, [])
+        var candidates: [String] = []
+        var duplicateCount = 0
+        await update(0, assets.count, [], [], 0)
         var recent: [String] = []
         for index in 0..<assets.count {
             if Task.isCancelled { break }
             let asset = assets.object(at: index)
             recent.append(asset.localIdentifier)
             if recent.count > 4 { recent.removeFirst() }
-            if index < 4 { await update(index, assets.count, recent) }
+            if index < 4 { await update(index, assets.count, recent, candidates, duplicateCount) }
             let resources = PHAssetResource.assetResources(for: asset)
             let video = asset.mediaType == .video
             let primaryType: PHAssetResourceType = video ? .video : .photo
@@ -852,6 +860,11 @@ enum LibraryDuplicateScanner {
                     }
                     let live = asset.mediaSubtypes.contains(.photoLive)
                     let key = "\(asset.mediaType.rawValue):\(live):" + keys.sorted().joined(separator: "|")
+                    if matches[key] != nil {
+                        duplicateCount += 1
+                        candidates.append(asset.localIdentifier)
+                        candidates = Array(candidates.suffix(8))
+                    }
                     matches[key, default: []].append(DuplicatePhoto(id: asset.localIdentifier,
                         filename: original.originalFilename, created: asset.creationDate,
                         modified: asset.modificationDate, favorite: asset.isFavorite, live: live, video: video))
@@ -862,7 +875,7 @@ enum LibraryDuplicateScanner {
                 skipped += 1
             }
             if (index + 1).isMultiple(of: 16) || index + 1 == assets.count {
-                await update(index + 1, assets.count, recent)
+                await update(index + 1, assets.count, recent, candidates, duplicateCount)
             }
         }
         let groups = matches.compactMap { key, photos in
@@ -909,6 +922,7 @@ final class ThumbnailFlow: ObservableObject {
         let id = UUID()
         let image: UIImage
         let started: TimeInterval
+        var falling = false
     }
 
     @Published private(set) var flights: [Flight] = []
@@ -917,6 +931,30 @@ final class ThumbnailFlow: ObservableObject {
     private var images: [String: UIImage] = [:]
     private var desired: [String] = []
     private var cursor = 0
+    private var seenCandidates = Set<String>()
+    private var candidateRequests: [PHImageRequestID] = []
+    private var drops: [UIImage] = []
+    private var generation = UUID()
+
+    func receiveCandidates(_ identifiers: [String]) {
+        let token = generation
+        for identifier in identifiers where seenCandidates.insert(identifier).inserted {
+            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else { continue }
+            let options = PHImageRequestOptions()
+            options.isNetworkAccessAllowed = false
+            options.deliveryMode = .fastFormat
+            let request = PHImageManager.default().requestImage(
+                for: asset, targetSize: CGSize(width: 136, height: 136),
+                contentMode: .aspectFill, options: options
+            ) { [weak self] image, _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == token, let image else { return }
+                    if self.drops.count < 8 { self.drops.append(image) }
+                }
+            }
+            candidateRequests.append(request)
+        }
+    }
 
     func update(_ identifiers: [String]) {
         desired = Array(identifiers.suffix(4))
@@ -956,6 +994,9 @@ final class ThumbnailFlow: ObservableObject {
     func advance() {
         let now = ProcessInfo.processInfo.systemUptime
         flights.removeAll { now - $0.started >= 3.8 }
+        if !drops.isEmpty {
+            flights.append(Flight(image: drops.removeFirst(), started: now, falling: true))
+        }
         guard !ready.isEmpty else { return }
         let image = ready[cursor % ready.count]
         cursor = (cursor + 1) % ready.count
@@ -963,6 +1004,11 @@ final class ThumbnailFlow: ObservableObject {
     }
 
     func stop() {
+        generation = UUID()
+        for request in candidateRequests { PHImageManager.default().cancelImageRequest(request) }
+        candidateRequests = []
+        seenCandidates = []
+        drops = []
         for request in requested.values { PHImageManager.default().cancelImageRequest(request) }
         requested = [:]
         images = [:]
@@ -974,6 +1020,8 @@ final class ThumbnailFlow: ObservableObject {
 
 struct ScanningThumbnails: View {
     let identifiers: [String]
+    let candidates: [String]
+    let candidateCount: Int
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var flow = ThumbnailFlow()
 
@@ -989,23 +1037,47 @@ struct ScanningThumbnails: View {
             } else {
                 TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { _ in
                     let now = ProcessInfo.processInfo.systemUptime
-                    ZStack(alignment: .leading) {
+                    ZStack(alignment: .topLeading) {
+                        RoundedRectangle(cornerRadius: 20)
+                            .fill(AppPalette.accent.opacity(0.09))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 20)
+                                    .strokeBorder(AppPalette.accent.opacity(0.35), style: StrokeStyle(lineWidth: 1, dash: [5, 5]))
+                            }
+                            .frame(height: 60)
+                            .overlay {
+                                HStack {
+                                    Label("重复候选", systemImage: "square.stack.3d.down.right.fill")
+                                    Spacer()
+                                    Text("\(candidateCount)").font(.headline.monospacedDigit())
+                                }
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(AppPalette.accent)
+                                .padding(.horizontal, 16)
+                            }
+                            .offset(y: 156)
                         ForEach(flow.flights) { flight in
-                            let phase = min(1, max(0, (now - flight.started) / 3.8))
-                            thumbnail(flight.image)
-                                .opacity(min(1, min(phase / 0.14, (1 - phase) / 0.18)))
-                                .offset(x: CGFloat(phase) * (geometry.size.width + 84) - 76)
+                            let age = max(0, now - flight.started)
+                            if flight.falling {
+                                fallingThumbnail(flight, age: age, width: geometry.size.width)
+                            } else {
+                                let phase = min(1, age / 3.8)
+                                thumbnail(flight.image)
+                                    .opacity(min(1, min(phase / 0.14, (1 - phase) / 0.18)))
+                                    .offset(x: CGFloat(phase) * (geometry.size.width + 84) - 76)
+                            }
                         }
                     }
-                    .frame(width: geometry.size.width, height: 76, alignment: .leading)
+                    .frame(width: geometry.size.width, height: 220, alignment: .topLeading)
                 }
             }
         }
-        .frame(height: 76)
+        .frame(height: reduceMotion ? 76 : 220)
         .clipped()
         .accessibilityHidden(true)
-        .onAppear { flow.update(identifiers) }
+        .onAppear { flow.update(identifiers); flow.receiveCandidates(candidates) }
         .onChange(of: identifiers) { flow.update($0) }
+        .onChange(of: candidates) { flow.receiveCandidates($0) }
         .task(id: reduceMotion) {
             guard !reduceMotion else { return }
             while !Task.isCancelled {
@@ -1015,6 +1087,26 @@ struct ScanningThumbnails: View {
             }
         }
         .onDisappear { flow.stop() }
+    }
+
+    private func fallingThumbnail(_ flight: ThumbnailFlow.Flight, age: Double, width: CGFloat) -> some View {
+        let approach = min(1, age / 0.9)
+        let fall = max(0, age - 0.9)
+        let impact = 0.58
+        let afterImpact = max(0, fall - impact)
+        let bounce = 22 * exp(-afterImpact * 5) * abs(sin(afterImpact * 13))
+        let y = fall < impact ? 140 * pow(fall / impact, 2) : 140 - bounce
+        let x = -76 + (width * 0.52 + 42) * approach
+        let spin = fall < impact ? fall * 42 : 24 + sin(afterImpact * 12) * 7 * exp(-afterImpact * 5)
+        return thumbnail(flight.image)
+            .overlay {
+                RoundedRectangle(cornerRadius: 14).strokeBorder(Color.orange, lineWidth: 2)
+            }
+            .shadow(color: .black.opacity(0.18), radius: 9, x: 2, y: 6)
+            .rotationEffect(.degrees(spin))
+            .scaleEffect(1 - min(0.3, afterImpact * 0.15))
+            .opacity(min(1, age / 0.18) * max(0, 1 - max(0, age - 2.2) / 0.5))
+            .offset(x: x, y: y)
     }
 
     private func thumbnail(_ image: UIImage) -> some View {
