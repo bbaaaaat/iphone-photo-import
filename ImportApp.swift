@@ -521,6 +521,7 @@ struct LibraryDuplicatesView: View {
     @State private var selected = Set<String>()
     @State private var scanID: UUID?
     @State private var status = "在本机查找文件内容完全相同的照片和视频。"
+    @State private var thumbnailIDs: [String] = []
     @State private var scanned = 0
     @State private var total = 0
     @State private var scanning = false
@@ -541,6 +542,7 @@ struct LibraryDuplicatesView: View {
                             .font(.system(.title, design: .rounded, weight: .bold))
                         Text(status).font(.subheadline).foregroundStyle(.secondary)
                         if scanning {
+                            ScanningThumbnails(identifiers: thumbnailIDs)
                             if total > 0 {
                                 ProgressView(value: Double(scanned), total: Double(total))
                                 Text("已检查 \(scanned) / \(total)")
@@ -550,6 +552,7 @@ struct LibraryDuplicatesView: View {
                         Button {
                             groups = []
                             selected = []
+                            thumbnailIDs = []
                             scanned = 0
                             total = 0
                             scanning = true
@@ -677,8 +680,9 @@ struct LibraryDuplicatesView: View {
         let limited = access == .limited
         status = limited ? "正在扫描允许访问的照片…" : "正在检查本机照片…"
         let worker = Task.detached(priority: .userInitiated) {
-            await LibraryDuplicateScanner.scan { done, count in
+            await LibraryDuplicateScanner.scan { done, count, identifiers in
                 await MainActor.run {
+                    thumbnailIDs = identifiers
                     scanned = done
                     total = count
                 }
@@ -820,7 +824,7 @@ enum LibraryDuplicateScanner {
         let skipped: Int
     }
 
-    static func scan(update: @Sendable (Int, Int) async -> Void) async -> Result {
+    static func scan(update: @Sendable (Int, Int, [String]) async -> Void) async -> Result {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         options.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d",
@@ -828,10 +832,14 @@ enum LibraryDuplicateScanner {
         let assets = PHAsset.fetchAssets(with: options)
         var matches: [String: [DuplicatePhoto]] = [:]
         var skipped = 0
-        await update(0, assets.count)
+        await update(0, assets.count, [])
+        var recent: [String] = []
         for index in 0..<assets.count {
             if Task.isCancelled { break }
             let asset = assets.object(at: index)
+            recent.append(asset.localIdentifier)
+            if recent.count > 4 { recent.removeFirst() }
+            if index < 4 { await update(index, assets.count, recent) }
             let resources = PHAssetResource.assetResources(for: asset)
             let video = asset.mediaType == .video
             let primaryType: PHAssetResourceType = video ? .video : .photo
@@ -854,7 +862,7 @@ enum LibraryDuplicateScanner {
                 skipped += 1
             }
             if (index + 1).isMultiple(of: 16) || index + 1 == assets.count {
-                await update(index + 1, assets.count)
+                await update(index + 1, assets.count, recent)
             }
         }
         let groups = matches.compactMap { key, photos in
@@ -890,6 +898,78 @@ enum LibraryDuplicateScanner {
                 if let error { continuation.resume(throwing: error) }
                 else { continuation.resume(returning: digest.finish()) }
             }
+        }
+    }
+}
+
+struct ScanningThumbnails: View {
+    let identifiers: [String]
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { geometry in
+            if reduceMotion {
+                HStack(spacing: 10) {
+                    ForEach(identifiers, id: \.self) { identifier in
+                        ScanThumbnail(identifier: identifier)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+                    let time = context.date.timeIntervalSinceReferenceDate
+                    ZStack(alignment: .leading) {
+                        ForEach(Array(identifiers.enumerated()), id: \.element) { index, identifier in
+                            let phase = (time / 3.2 + Double(index) / 4)
+                                .truncatingRemainder(dividingBy: 1)
+                            ScanThumbnail(identifier: identifier)
+                                .opacity(min(1, min(phase / 0.16, (1 - phase) / 0.20)))
+                                .offset(x: CGFloat(phase) * (geometry.size.width + 76) - 76)
+                        }
+                    }
+                    .frame(width: geometry.size.width, height: 76, alignment: .leading)
+                }
+            }
+        }
+        .frame(height: 76)
+        .clipped()
+        .accessibilityHidden(true)
+    }
+}
+
+struct ScanThumbnail: View {
+    let identifier: String
+    @State private var image: UIImage?
+    @State private var request: PHImageRequestID?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 14).fill(AppPalette.accent.opacity(0.12))
+            if let image {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else {
+                Image(systemName: "photo").foregroundStyle(AppPalette.accent)
+            }
+        }
+        .frame(width: 68, height: 68)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(AppPalette.border) }
+        .onAppear {
+            guard request == nil,
+                  let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else { return }
+            let options = PHImageRequestOptions()
+            options.isNetworkAccessAllowed = false
+            options.deliveryMode = .fastFormat
+            request = PHImageManager.default().requestImage(
+                for: asset, targetSize: CGSize(width: 136, height: 136),
+                contentMode: .aspectFill, options: options
+            ) { thumbnail, _ in
+                DispatchQueue.main.async { image = thumbnail }
+            }
+        }
+        .onDisappear {
+            if let request { PHImageManager.default().cancelImageRequest(request) }
+            request = nil
         }
     }
 }
